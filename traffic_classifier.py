@@ -1,114 +1,48 @@
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import MAIN_DISPATCHER, set_ev_cls
+from ryu.ofproto import ofproto_v1_3
+from ryu.lib.packet import packet
+from ryu.lib.packet import ethernet
+from ryu.lib.packet import ipv4
+from ryu.lib.packet import tcp
+from ryu.lib.packet import udp
+from ryu.lib.packet import icmp
 from collections import defaultdict
 
 
-class TrafficClassifier:
-    """
-    Protocol-level traffic classifier.
+class TrafficClassifier(app_manager.RyuApp):
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
-    Keeps running counters for each protocol label and exposes
-    helper methods used by both the controller and the test suite.
-    Intentionally contains NO Ryu imports so it can be unit-tested
-    without a running OpenFlow environment.
-    """
-
-    KNOWN_PROTOCOLS = ("TCP", "UDP", "ICMP", "OTHER")
-
-    def __init__(self):
-        self.protocol_count: dict[str, int] = defaultdict(int)
-        self.total_packets: int = 0
-
-    # ------------------------------------------------------------------
-    # Classification
-    # ------------------------------------------------------------------
-
-    def classify(self, has_ip: bool, has_tcp: bool, has_udp: bool, has_icmp: bool) -> str:
-        """
-        Return the protocol label for a single packet given boolean flags
-        produced by the caller after inspecting the parsed packet headers.
-
-        Priority: TCP > UDP > ICMP > OTHER (mirrors the original handler).
-        Non-IP packets are always "OTHER".
-        """
-        if not has_ip:
-            return "OTHER"
-        if has_tcp:
-            return "TCP"
-        if has_udp:
-            return "UDP"
-        if has_icmp:
-            return "ICMP"
-        return "OTHER"
-
-    # ------------------------------------------------------------------
-    # Accounting
-    # ------------------------------------------------------------------
-
-    def record(self, protocol: str) -> None:
-        """Increment counters for *protocol* and the global packet total."""
-        self.total_packets += 1
-        self.protocol_count[protocol] += 1
-
-    def classify_and_record(
-        self,
-        has_ip: bool,
-        has_tcp: bool = False,
-        has_udp: bool = False,
-        has_icmp: bool = False,
-    ) -> str:
-        """Convenience wrapper: classify, record, and return the label."""
-        protocol = self.classify(has_ip, has_tcp, has_udp, has_icmp)
-        self.record(protocol)
-        return protocol
-
-    # ------------------------------------------------------------------
-    # Statistics
-    # ------------------------------------------------------------------
-
-    def get_statistics(self) -> dict:
-        """
-        Return a dict with per-protocol counts and percentages plus the
-        total packet count.  Safe to call even when total_packets == 0.
-        """
-        stats = {"total_packets": self.total_packets, "protocols": {}}
-        for proto, count in self.protocol_count.items():
-            pct = (count / self.total_packets * 100) if self.total_packets else 0.0
-            stats["protocols"][proto] = {"count": count, "percentage": round(pct, 2)}
-        return stats
-
-    def format_statistics(self) -> str:
-        """Return a human-readable statistics block (mirrors the original logger output)."""
-        lines = ["\n===== TRAFFIC ANALYSIS ====="]
-        for proto, count in self.protocol_count.items():
-            pct = (count / self.total_packets * 100) if self.total_packets else 0.0
-            lines.append(f"{proto}: {count} packets ({pct:.2f}%)")
-        lines.append(f"Total Packets: {self.total_packets}\n")
-        return "\n".join(lines)
-
-    def reset(self) -> None:
-        """Clear all counters (useful between test cases or operator resets)."""
+    def __init__(self, *args, **kwargs):
+        super(TrafficClassifier, self).__init__(*args, **kwargs)
         self.protocol_count = defaultdict(int)
         self.total_packets = 0
 
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+        msg = ev.msg
+        datapath = msg.datapath
+        pkt = packet.Packet(msg.data)
+        self.total_packets += 1
+        protocol = "OTHER"
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
+        if ip_pkt:
+            if pkt.get_protocol(tcp.tcp):
+                protocol = "TCP"
+            elif pkt.get_protocol(udp.udp):
+                protocol = "UDP"
+            elif pkt.get_protocol(icmp.icmp):
+                protocol = "ICMP"
+        self.protocol_count[protocol] += 1
+        self.logger.info(f"Packet #{self.total_packets}: {protocol}")
+        # Show stats every 10 packets
+        if self.total_packets % 10 == 0:
+            self.show_statistics()
 
-if __name__ == "__main__":
-    import random
-
-    try:
-        n = int(input("Enter number of packets to send: "))
-    except ValueError:
-        print("Please enter a valid integer.")
-        exit(1)
-
-    clf = TrafficClassifier()
-    protocols = ["TCP", "UDP", "ICMP", "OTHER"]
-
-    for _ in range(n):
-        proto = random.choice(protocols)
-        clf.classify_and_record(
-            has_ip   = proto != "OTHER",
-            has_tcp  = proto == "TCP",
-            has_udp  = proto == "UDP",
-            has_icmp = proto == "ICMP",
-        )
-
-    print(clf.format_statistics())
+    def show_statistics(self):
+        self.logger.info("\n===== TRAFFIC ANALYSIS =====")
+        for proto, count in self.protocol_count.items():
+            percentage = (count / self.total_packets) * 100
+            self.logger.info(f"{proto}: {count} packets ({percentage:.2f}%)")
+        self.logger.info(f"Total Packets: {self.total_packets}\n")
